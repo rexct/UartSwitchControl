@@ -1,4 +1,7 @@
 ﻿using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Drawing;
 //using System.Text;
 //using System.Threading.Tasks;
 using System.IO.Ports;
@@ -7,9 +10,6 @@ using System.Linq;
 using System.Text;
 using System.Windows.Forms;
 using Timer = System.Windows.Forms.Timer;
-
-using System.Collections.Generic;
-using System.Drawing;
 
 namespace UartSwitchControl
 {
@@ -34,12 +34,30 @@ namespace UartSwitchControl
         private ToolStripStatusLabel? statusConnLabel; // 連線狀態
         private ToolStripStatusLabel? statusTxLabel;   // 最後一次 TX 摘要
 
+        // ====== 循環切換 UI 與狀態 ======
+        private ComboBox cbCycleNumber;   // 1~8
+        private TextBox txtOnMs;          // A 毫秒(開)
+        private TextBox txtOffMs;         // B 毫秒(關)
+        private TextBox txtStopSec;       // C 秒(停止)
+        private Button btnCycleToggle;    // 開始/停止
+
+        private Timer cycleTimer;         // 用來交替開/關，Interval 動態切換 A/B
+        private Stopwatch cycleWatch;     // 計算經過秒數以判斷是否達到 C
+
+        private bool cycleActive = false;
+        private int cycleNumber = 1;
+        private int cycleOnMs = 500;
+        private int cycleOffMs = 500;
+        private int cycleStopSec = 10;
+        private bool cycleStateIsOn = false; // 目前狀態（在循環中）
+        // =================================
+
         public MainForm()
         {
 
             this.Text = "UART 8路開關控制";
             this.Width = 400;
-            this.Height = 440;
+            this.Height = 520;
             this.FormBorderStyle = FormBorderStyle.FixedSingle;
             this.MaximizeBox = false;
             this.StartPosition = FormStartPosition.CenterScreen;
@@ -138,6 +156,54 @@ namespace UartSwitchControl
                 statusTxLabel.Text = "";
             };
             Controls.Add(btnClearLog);
+
+            // ====== 循環切換控制區 ======
+            int baseTop = 370; // 放在左側下方，8 路按鈕之下
+            int offsetV = 40;
+            Label lblNum = new Label { Left = 10, Top = baseTop, Width = 45, Text = "編號：" };
+            Controls.Add(lblNum);
+
+            cbCycleNumber = new ComboBox
+            {
+                Left = 55,
+                Top = baseTop - 3,
+                Width = 40,
+                DropDownStyle = ComboBoxStyle.DropDownList
+            };
+            cbCycleNumber.Items.AddRange(Enumerable.Range(1, 8).Select(i => (object)i).ToArray());
+            cbCycleNumber.SelectedIndex = 0;
+            Controls.Add(cbCycleNumber);
+
+            Label lblA = new Label { Left = 100, Top = baseTop, Width = 50, Text = "開(ms)：" };
+            Controls.Add(lblA);
+            txtOnMs = new TextBox { Left = 155, Top = baseTop - 3, Width = 80, Text = "500" };
+            Controls.Add(txtOnMs);
+
+            Label lblB = new Label { Left = 240, Top = baseTop, Width = 50, Text = "關(ms)：" };
+            Controls.Add(lblB);
+            txtOffMs = new TextBox { Left = 290, Top = baseTop - 3, Width = 80, Text = "500" };
+            Controls.Add(txtOffMs);
+
+            Label lblC = new Label { Left = 10, Top = baseTop + offsetV, Width = 70, Text = "停止(秒)：" };
+            Controls.Add(lblC);
+            txtStopSec = new TextBox { Left = 90, Top = baseTop - 3 + offsetV, Width = 80, Text = "10" };
+            Controls.Add(txtStopSec);
+
+            btnCycleToggle = new Button
+            {
+                Left = 280,
+                Top = baseTop - 6 + offsetV,
+                Width = 80,
+                Height = 28,
+                Text = "開始" // Toggle start button
+            };
+            btnCycleToggle.Click += BtnCycleToggle_Click;
+            Controls.Add(btnCycleToggle);
+
+            cycleTimer = new Timer();
+            cycleTimer.Tick += CycleTimer_Tick;
+            cycleWatch = new Stopwatch();
+            // =================================
 
             // 狀態列
             statusStrip = new StatusStrip();
@@ -378,17 +444,121 @@ namespace UartSwitchControl
             rtbLog.ScrollToCaret();
         }
 
+        // ====== 循環切換事件處理 ======
+
+        private void BtnCycleToggle_Click(object sender, EventArgs e)
+        {
+            if (!cycleActive)
+            {
+                // 解析與驗證輸入
+                if (!int.TryParse((cbCycleNumber.SelectedItem ?? 1).ToString(), out cycleNumber) ||
+                    cycleNumber < 1 || cycleNumber > 8)
+                {
+                    MessageBox.Show("請選擇 1~8 的號碼"); return;
+                }
+                if (!int.TryParse(txtOnMs.Text.Trim(), out cycleOnMs) || cycleOnMs <= 0)
+                {
+                    MessageBox.Show("A（開啟毫秒）需為正整數"); return;
+                }
+                if (!int.TryParse(txtOffMs.Text.Trim(), out cycleOffMs) || cycleOffMs <= 0)
+                {
+                    MessageBox.Show("B（關閉毫秒）需為正整數"); return;
+                }
+                if (!int.TryParse(txtStopSec.Text.Trim(), out cycleStopSec) || cycleStopSec <= 0)
+                {
+                    MessageBox.Show("C（停止秒數）需為正整數"); return;
+                }
+
+                // 鎖定 UI（避免切換期間被改動）
+                SetCycleUiEnabled(false);
+
+                // 啟動循環：立即「開」
+                cycleActive = true;
+                btnCycleToggle.Text = "停止";
+                cycleStateIsOn = true;
+                SendUartCommand(cycleNumber, 1);
+                UpdateButtonColors(cycleNumber, true);
+
+                // 啟動計時與交替 Timer
+                cycleWatch.Restart();
+                cycleTimer.Interval = cycleOnMs; // 下一次 Tick 後切到關
+                cycleTimer.Start();
+            }
+            else
+            {
+                StopCycle();
+            }
+        }
+
+        private void CycleTimer_Tick(object sender, EventArgs e)
+        {
+            // 時間到就停止
+            if (cycleWatch.Elapsed.TotalSeconds >= cycleStopSec)
+            {
+                StopCycle();
+                return;
+            }
+
+            // 交替狀態
+            if (cycleStateIsOn)
+            {
+                // 由 開 -> 關
+                cycleStateIsOn = false;
+                SendUartCommand(cycleNumber, 0);
+                UpdateButtonColors(cycleNumber, false);
+                cycleTimer.Interval = cycleOffMs; // 下一次 Tick 再切回開
+            }
+            else
+            {
+                // 由 關 -> 開
+                cycleStateIsOn = true;
+                SendUartCommand(cycleNumber, 1);
+                UpdateButtonColors(cycleNumber, true);
+                cycleTimer.Interval = cycleOnMs;
+            }
+        }
+
+        private void StopCycle()
+        {
+            cycleTimer.Stop();
+            cycleWatch.Stop();
+            cycleActive = false;
+            btnCycleToggle.Text = "開始";
+            SetCycleUiEnabled(true);
+            // 停止時不強制改變當前開關狀態；保持最後一次切換的樣子
+        }
+
+        private void SetCycleUiEnabled(bool enabled)
+        {
+            cbCycleNumber.Enabled = enabled;
+            txtOnMs.Enabled = enabled;
+            txtOffMs.Enabled = enabled;
+            txtStopSec.Enabled = enabled;
+        }
+
+        // =================================
+
         protected override void OnFormClosed(FormClosedEventArgs e)
         {
             try
             {
-                if (serialPort != null && serialPort.IsOpen)
-                    serialPort.Close();
+                if (serialPort != null)
+                {
+                    if (serialPort.IsOpen) serialPort.Close();
+                    serialPort.Dispose();
+                }
             }
             catch { /* ignore */ }
 
-            if (portScanTimer != null)
-                portScanTimer.Dispose();
+            try
+            {
+                portScanTimer?.Stop();
+                portScanTimer?.Dispose();
+
+                cycleTimer?.Stop();
+                cycleTimer?.Dispose();
+            }
+            catch { /* ignore */ }
 
             base.OnFormClosed(e);
         }
